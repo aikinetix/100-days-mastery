@@ -60,9 +60,11 @@ function looksLikeWeatherQuestion(question) {
  * so parsing still works if the model wraps the object.
  */
 function parseRoutingOutput(text) {
+  console.log(text)
   let raw = (text || "").trim();
   const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) raw = fence[1].trim();
+  console.log(JSON.parse(raw))
   return JSON.parse(raw);
 }
 
@@ -78,7 +80,9 @@ async function getWeather(city) {
 
   try {
     const geoUrl = `${OPEN_METEO_GEO}?name=${encodeURIComponent(q)}&count=1`;
+    console.log("STEP 1: Calling geocoding API");
     const geoRes = await fetch(geoUrl);
+    console.log("STEP 2: Got geo response");
     if (!geoRes.ok) {
       return `Weather lookup failed (geocoding HTTP ${geoRes.status}). Try again later.`;
     }
@@ -92,7 +96,9 @@ async function getWeather(city) {
     const wxUrl =
       `${OPEN_METEO_FORECAST}?latitude=${latitude}&longitude=${longitude}` +
       "&current=temperature_2m,weather_code,wind_speed_10m&wind_speed_unit=kmh";
-    const wxRes = await fetch(wxUrl);
+      console.log("STEP 3: Calling weather API");
+      const wxRes = await fetch(wxUrl);
+      console.log("STEP 4: Got weather response");
     if (!wxRes.ok) {
       return `Weather lookup failed (forecast HTTP ${wxRes.status}). Try again later.`;
     }

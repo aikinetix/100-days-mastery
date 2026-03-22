@@ -123,6 +123,10 @@ Expected shape:
 - Success: `{"originalQuestion":"...","answer":"...","source":"tool"|"llm","routing":{...}}`
 - Error: `{"error":"...","code":"...","type":"...","cause":"..."}`
 
+## Workflow diagrams (Mermaid)
+
+See **[WORKFLOW.md](./WORKFLOW.md)** for flowchart + sequence diagrams (Markdown Preview Enhanced).
+
 ## Troubleshooting
 
 - **`Missing OPENAI_API_KEY`**: Ensure `.env` exists in `day-4/` with `OPENAI_API_KEY=...`, then restart the server.
