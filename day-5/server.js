@@ -3,11 +3,9 @@
 require("dotenv").config();
 
 /**
- * Day 4 — "controller + executor" pattern:
- * 1) OpenAI (router): returns strict JSON — use tool getWeather(city) or answer via llm.
- * 2) This app: parses JSON, optional fallback if the model mis-routes weather questions.
- * 3) Executor: either getWeather() (Open-Meteo, no key) or a second OpenAI call for the final answer.
- * Requires: OPENAI_API_KEY in .env for OpenAI only. Weather uses public Open-Meteo HTTPS APIs.
+ * Day 5 — controller + executor + in-memory sessions:
+ * `sessionId` maps to prior user/assistant turns; both OpenAI calls get that history as context.
+ * Weather tool returns only a temperature string (e.g. 22°C) from Open-Meteo.
  */
 
 // Express is a small web framework for Node.js. It helps us define HTTP routes like POST /ask.
@@ -21,26 +19,8 @@ const app = express();
 // Without this, req.body would be undefined for JSON POST requests.
 app.use(express.json());
 
-// Free weather data via Open-Meteo (no API key): geocode city, then current conditions.
-// Docs: https://open-meteo.com/ (Geocoding API + Weather Forecast API)
-const OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search";
-const OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast";
-
-/** Map Open-Meteo WMO weather_code to a short English label for the answer string. */
-function wmoWeatherLabel(code) {
-  if (code === undefined || code === null) return "unknown conditions";
-  const c = Number(code);
-  if (c === 0) return "clear sky";
-  if (c <= 3) return "mainly clear to overcast";
-  if (c <= 48) return "foggy";
-  if (c <= 57) return "drizzle";
-  if (c <= 67) return "rain";
-  if (c <= 77) return "snow";
-  if (c <= 82) return "rain showers";
-  if (c <= 86) return "snow showers";
-  if (c <= 99) return "thunderstorm";
-  return "mixed conditions";
-}
+const GEO = "https://geocoding-api.open-meteo.com/v1/search";
+const WX = "https://api.open-meteo.com/v1/forecast";
 
 /** Best-effort city name for "weather in X" style questions (used if the router LLM mis-routes). */
 function extractCityFromWeatherQuestion(question) {
@@ -50,6 +30,11 @@ function extractCityFromWeatherQuestion(question) {
   return null;
 }
 
+/**
+ * Checks if the user's question relates to weather, temperature, or a forecast.
+ * @param {string} question - The user's input string.
+ * @returns {boolean} True if the question indicates a weather request.
+ */
 function looksLikeWeatherQuestion(question) {
   // Match common "current conditions" asks; avoid lone "rain/snow" without a place.
   return /\bweather\b|\btemperature\b|\bforecast\b/i.test(question);
@@ -60,74 +45,70 @@ function looksLikeWeatherQuestion(question) {
  * so parsing still works if the model wraps the object.
  */
 function parseRoutingOutput(text) {
-  console.log(text)
   let raw = (text || "").trim();
   const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) raw = fence[1].trim();
-  console.log(JSON.parse(raw))
   return JSON.parse(raw);
 }
 
-/**
- * Fetch current conditions for a place name using Open-Meteo (geocode + forecast).
- * Returns a human-readable one-line string (or an error message string on failure).
- */
+/** Geocode + forecast; on success returns only `${temp}${unit}` (e.g. 22°C). */
 async function getWeather(city) {
   const q = (city || "").trim();
-  if (!q) {
-    return "Please provide a city name for the weather.";
-  }
-
+  if (!q) return "no city";
   try {
-    const geoUrl = `${OPEN_METEO_GEO}?name=${encodeURIComponent(q)}&count=1`;
-    console.log("STEP 1: Calling geocoding API");
-    const geoRes = await fetch(geoUrl);
-    console.log("STEP 2: Got geo response");
-    if (!geoRes.ok) {
-      return `Weather lookup failed (geocoding HTTP ${geoRes.status}). Try again later.`;
-    }
-    const geoData = await geoRes.json();
-    const place = geoData.results?.[0];
-    if (!place) {
-      return `Could not find a location named "${q}". Try another spelling or city name.`;
-    }
-
-    const { name, country, latitude, longitude } = place;
-    const wxUrl =
-      `${OPEN_METEO_FORECAST}?latitude=${latitude}&longitude=${longitude}` +
-      "&current=temperature_2m,weather_code,wind_speed_10m&wind_speed_unit=kmh";
-      console.log("STEP 3: Calling weather API");
-      const wxRes = await fetch(wxUrl);
-      console.log("STEP 4: Got weather response");
-    if (!wxRes.ok) {
-      return `Weather lookup failed (forecast HTTP ${wxRes.status}). Try again later.`;
-    }
-    const wxData = await wxRes.json();
-    const cur = wxData.current;
-    if (!cur) {
-      return `No current weather data for ${name}${country ? `, ${country}` : ""}.`;
-    }
-
-    const temp = cur.temperature_2m;
-    const unit = wxData.current_units?.temperature_2m ?? "C";
-    const wind = cur.wind_speed_10m;
-    const windUnit = wxData.current_units?.wind_speed_10m ?? "km/h";
-    const desc = wmoWeatherLabel(cur.weather_code);
-
-    return (
-      `Current weather in ${name}${country ? `, ${country}` : ""}: ` +
-      `${temp}${unit}, ${desc}` +
-      (wind != null ? `, wind ${wind} ${windUnit}` : "") +
-      "."
-    );
-  } catch (e) {
-    return `Weather service error: ${e?.message || "network or timeout"}.`;
+    const rg = await fetch(`${GEO}?name=${encodeURIComponent(q)}&count=1`);
+    if (!rg.ok) return "error";
+    const p = (await rg.json()).results?.[0];
+    if (!p) return "not found";
+    const rw = await fetch(`${WX}?latitude=${p.latitude}&longitude=${p.longitude}&current=temperature_2m`);
+    if (!rw.ok) return "error";
+    const { current: c, current_units: units } = await rw.json();
+    if (c?.temperature_2m == null) return "n/a";
+    return `${c.temperature_2m}${units?.temperature_2m ?? "°C"}`;
+  } catch {
+    return "error";
   }
 }
 
 // Create an OpenAI client using the API key from the environment.
 // process.env is where Node stores environment variables.
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// In-memory: sessionId -> [{ role: "user" | "assistant", content: string }, ...]
+const sessionStore = Object.create(null);
+const MAX_SESSION_MESSAGES = 40;
+
+/**
+ * Retrieves the message history for a given session, capping at MAX_SESSION_MESSAGES.
+ * @param {string} sessionId - The unique identifier for the conversational session.
+ * @returns {Array<{role: string, content: string}>} Array of prior messages.
+ */
+function getSessionMessages(sessionId) {
+  const list = sessionStore[sessionId];
+  if (!list?.length) return [];
+  return list.length > MAX_SESSION_MESSAGES ? list.slice(-MAX_SESSION_MESSAGES) : list;
+}
+
+/** Turn prior turns into a text block prepended to OpenAI `input`. */
+function formatHistoryContext(messages) {
+  if (!messages.length) return "";
+  const lines = messages.map((m) =>
+    m.role === "user" ? `User: ${m.content}` : `Assistant: ${m.content}`
+  );
+  return `Prior conversation (oldest first):\n${lines.join("\n")}\n\n`;
+}
+
+/**
+ * Appends a user question and the assistant's answer to the session's message history.
+ * @param {string} sessionId - The unique identifier for the conversational session.
+ * @param {string} userText - The current user's question.
+ * @param {string} assistantText - The final answer returned by the assistant.
+ */
+function recordTurn(sessionId, userText, assistantText) {
+  if (!sessionStore[sessionId]) sessionStore[sessionId] = [];
+  sessionStore[sessionId].push({ role: "user", content: userText });
+  sessionStore[sessionId].push({ role: "assistant", content: assistantText });
+}
 
 app.post("/ask", async (req, res) => {
   try {
@@ -137,19 +118,26 @@ app.post("/ask", async (req, res) => {
       return res.status(500).json({ error: "Missing OPENAI_API_KEY in environment." });
     }
 
-    // Read "question" from the request body (JSON).
-    // Example body: { "question": "Explain REST API simply" }
+    // Read "question" and "sessionId" from the request body (JSON).
     const question = req.body?.question;
+    const sessionIdRaw = req.body?.sessionId;
+    const sessionId =
+      typeof sessionIdRaw === "string" && sessionIdRaw.trim() ? sessionIdRaw.trim() : "default";
+
     // Validate the input so we don't send invalid requests to OpenAI.
     if (typeof question !== "string" || question.trim().length === 0) {
       return res.status(400).json({ error: "Body must include non-empty 'question' string." });
     }
 
-    // Day 4 flow: LLM decides routing first, app executes that decision.
-    // Step A — Router LLM: JSON only { decision, tool, input }; input = city name when tool is getWeather.
+    const history = getSessionMessages(sessionId);
+    const historyBlock = formatHistoryContext(history);
+
+    // LLM routes first; app executes (tool = minimal getWeather, else final LLM).
+    // Step A — Router LLM: JSON only { decision, tool, input }; prior messages included as context.
     const routingResponse = await client.responses.create({
       model: "gpt-4.1-mini",
       input:
+        historyBlock +
         "You route user questions. Output NOTHING except one JSON object.\n\n" +
         "Available tool: getWeather(city) — use it whenever the user asks for current/real weather, " +
         "temperature, or forecast for a place (city/region).\n\n" +
@@ -160,13 +148,13 @@ app.post("/ask", async (req, res) => {
         "- Do not answer the question. Do not add markdown or text outside JSON.\n\n" +
         "JSON shape exactly:\n" +
         '{"decision":"tool"|"llm","tool":"getWeather"|null,"input":"<city or empty>"}\n\n' +
-        `User question:\n${question}`,
+        `Current user message:\n${question}`,
     });
 
     // Step B — Parse router output; on failure, default to llm path (routingSource stays "llm").
     let routing = { decision: "llm", tool: null, input: "", routingSource: "llm" };
     try {
-      const parsed = parseRoutingOutput(routingResponse.output_text || ""); 
+      const parsed = parseRoutingOutput(routingResponse.output_text || "");
       routing = {
         decision: parsed?.decision === "tool" ? "tool" : "llm",
         tool: typeof parsed?.tool === "string" ? parsed.tool : null,
@@ -198,7 +186,9 @@ app.post("/ask", async (req, res) => {
     // Step D — Tool path: Open-Meteo (no API key).
     if (routing.decision === "tool" && routing.tool === "getWeather") {
       const answer = await getWeather(routing.input);
+      recordTurn(sessionId, question, answer);
       return res.json({
+        sessionId,
         originalQuestion: question,
         answer,
         source: "tool",
@@ -206,16 +196,22 @@ app.post("/ask", async (req, res) => {
       });
     }
 
-    // Step E — LLM answer path: second OpenAI call with the original question.
+    // Step E — LLM answer path: second OpenAI call; include session history as context.
     const answerResponse = await client.responses.create({
       model: "gpt-4.1-mini",
-      input: question,
+      input:
+        historyBlock +
+        "Answer the user's latest message helpfully. Use prior conversation when it clarifies intent.\n\n" +
+        `Current user message:\n${question}`,
     });
 
-    // 4) Return final LLM answer.
+    const finalAnswer = answerResponse.output_text;
+    recordTurn(sessionId, question, finalAnswer);
+
     return res.json({
+      sessionId,
       originalQuestion: question,
-      answer: answerResponse.output_text,
+      answer: finalAnswer,
       source: "llm",
       routing,
     });
